@@ -3,6 +3,7 @@
 # 1) 新申请与改配交错（停用卡停接、另一张照常、归还后交驱动、按确认布局恢复）
 # 2) 改配失败停用 -> 同批次补报恢复
 # 3) 旧批次回报拒收
+# 4) 重跑复用 task_id 的归还凭据：迟到归还 / 老客户端 / 正常改配
 set -euo pipefail
 
 BASE="${BASE:-http://127.0.0.1:8000}"
@@ -64,6 +65,37 @@ post /driver/report '{"gpu_id":"gpu-1","generation":1,"status":"failed"}' || tru
 echo
 $CURL "$BASE/gpus/gpu-1" | j '"state=" + d["state"] + " gen=" + str(d["generation"]) + " layout=" + d["layout"]'
 post /driver/report '{"gpu_id":"gpu-1","generation":2,"status":"success","actual_layout":"large"}' >/dev/null
+
+echo
+echo "== 场景4：重跑复用 task_id 的归还凭据 =="
+post /admin/reset '{}' >/dev/null
+
+echo "-- 老客户端：首次成功领用后只凭 task_id 归还，期望 200 --"
+OLD=$(post /tasks/acquire '{"size":"large","task_id":"rerun"}' | j 'd["release_token"]')
+post /tasks/release '{"task_id":"rerun"}' || true
+
+echo "-- 同 ID 重跑再次领用，拿到新凭据（旧凭据应已不同）--"
+NEW=$(post /tasks/acquire '{"size":"large","task_id":"rerun"}' | j 'd["release_token"]')
+[ "$OLD" != "$NEW" ] && echo "新凭据 != 旧凭据 OK"
+
+echo "-- 上一轮归还迟到（带旧凭据），期望 409 且本次占用保留 --"
+post /tasks/release "{\"task_id\":\"rerun\",\"release_token\":\"$OLD\"}" || true
+$CURL "$BASE/gpus/gpu-0" | j '"occupied_by=" + str(d["partitions"][0]["occupied_by"])'
+
+echo "-- 再次领用后不带凭据归还，期望 409 --"
+post /tasks/release '{"task_id":"rerun"}' || true
+
+echo "-- 发起改配进入 draining，迟到旧凭据归还仍被拒，卡继续等待 --"
+post /reconfig '{"gpu_id":"gpu-0","target_layout":"split"}' >/dev/null
+post /tasks/release "{\"task_id\":\"rerun\",\"release_token\":\"$OLD\"}" || true
+$CURL "$BASE/gpus/gpu-0" | j '"state=" + d["state"] + " occupied_by=" + str(d["partitions"][0]["occupied_by"])'
+
+echo "-- 用当前凭据正常归还，最后一个分区释放后交给驱动 --"
+post /tasks/release "{\"task_id\":\"rerun\",\"release_token\":\"$NEW\"}" >/dev/null
+$CURL "$BASE/gpus/gpu-0" | j '"state=" + d["state"]'
+
+echo "-- 驱动 success 确认 split，正常完成改配 --"
+post /driver/report '{"gpu_id":"gpu-0","generation":1,"status":"success","actual_layout":"split"}' | j '"state=" + d["state"] + " layout=" + d["layout"]'
 
 echo
 echo "== 最终全景 =="

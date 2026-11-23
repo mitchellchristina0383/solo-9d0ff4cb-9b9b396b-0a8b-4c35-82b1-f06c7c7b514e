@@ -72,11 +72,20 @@ async def get_gpu(gpu_id: str) -> GPUOut:
     response_model=AcquireResponse,
     tags=[TAG_TASK],
     summary="按规格领用分区（large 领大分区，small 领小分区）",
+    description=(
+        "每次成功领用都返回新的 `release_token`。同一 task_id 重跑时，只有上一轮"
+        "已归还才允许再次领用；再次领用后归还必须携带最新凭据。"
+    ),
     responses={409: {"model": MessageOut}, 503: {"model": MessageOut}},
 )
 async def acquire_partition(req: AcquireRequest) -> AcquireResponse:
-    tid, gpu, part = await service.acquire(req.size, req.task_id)
-    return AcquireResponse(task_id=tid, gpu_id=gpu.id, partition_id=part.id)
+    tid, token, gpu, part = await service.acquire(req.size, req.task_id)
+    return AcquireResponse(
+        task_id=tid,
+        gpu_id=gpu.id,
+        partition_id=part.id,
+        release_token=token,
+    )
 
 
 @app.post(
@@ -84,10 +93,15 @@ async def acquire_partition(req: AcquireRequest) -> AcquireResponse:
     response_model=MessageOut,
     tags=[TAG_TASK],
     summary="任务结束归还分区",
-    responses={404: {"model": MessageOut}},
+    description=(
+        "自启动/重置以来同一 task_id 首次成功领用后可只凭 task_id 归还；"
+        "再次领用后必须携带该次领用返回的 `release_token`。只要提交了凭据，"
+        "就必须与当前领用匹配，否则 409 且现有占用保持不变。"
+    ),
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut}},
 )
 async def release_partition(req: ReleaseRequest) -> MessageOut:
-    gpu, part = await service.release(req.task_id)
+    gpu, part = await service.release(req.task_id, req.release_token)
     return MessageOut(detail=f"任务 {req.task_id} 已归还 {gpu.id}/{part.id}")
 
 

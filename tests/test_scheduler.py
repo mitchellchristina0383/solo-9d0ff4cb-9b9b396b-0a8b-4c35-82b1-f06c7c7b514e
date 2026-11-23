@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, service
 
 
 @pytest.fixture()
@@ -270,3 +270,167 @@ def test_draining_card_keeps_running_task_until_release(client: TestClient) -> N
     # 归还后才进入驱动环节
     client.post("/tasks/release", json={"task_id": "keep"})
     assert gpu_state(client, "gpu-0")["state"] == "reconfiguring"
+
+
+# ------------------------- 归还凭据 / 重跑防迟到归还 -------------------------
+
+def _acquire(client: TestClient, task_id: str, size: str = "large") -> dict:
+    r = client.post("/tasks/acquire", json={"size": size, "task_id": task_id})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_every_acquire_returns_fresh_release_token(client: TestClient) -> None:
+    first = _acquire(client, "job-a")
+    assert first["release_token"]
+    client.post("/tasks/release", json={"task_id": "job-a", "release_token": first["release_token"]})
+    second = _acquire(client, "job-a")
+    assert second["release_token"] and second["release_token"] != first["release_token"]
+
+
+def test_first_acquire_since_reset_can_release_with_task_id_only(client: TestClient) -> None:
+    """老客户端：启动/重置后首次成功领用仍可只凭 task_id 归还。"""
+    _acquire(client, "legacy")
+    r = client.post("/tasks/release", json={"task_id": "legacy"})
+    assert r.status_code == 200, r.text
+    assert gpu_state(client, "gpu-0")["partitions"][0]["occupied_by"] is None
+
+
+def test_late_release_from_previous_round_cannot_clear_current_lease(client: TestClient) -> None:
+    """迟到归还：上一轮凭据在重跑领用后晚到，必须被拒且不清本次占用。"""
+    old = _acquire(client, "job-a")
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    ).status_code == 200
+    new = _acquire(client, "job-a")
+    assert new["release_token"] != old["release_token"]
+
+    # 上一轮的归还请求晚到（旧凭据）
+    r = client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    )
+    assert r.status_code == 409
+    g0 = gpu_state(client, "gpu-0")
+    assert g0["partitions"][0]["occupied_by"] == "job-a"
+
+    # 当前凭据可正常归还
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": new["release_token"]}
+    ).status_code == 200
+    assert gpu_state(client, "gpu-0")["partitions"][0]["occupied_by"] is None
+
+
+def test_release_after_second_acquire_requires_token(client: TestClient) -> None:
+    """同一 ID 再次领用后，只凭 task_id 的归还必须被拒。"""
+    _acquire(client, "job-a")
+    client.post("/tasks/release", json={"task_id": "job-a"})
+    _acquire(client, "job-a")
+
+    r = client.post("/tasks/release", json={"task_id": "job-a"})
+    assert r.status_code == 409
+    assert gpu_state(client, "gpu-0")["partitions"][0]["occupied_by"] == "job-a"
+
+
+def test_failed_acquire_does_not_count_as_a_lease(client: TestClient) -> None:
+    """失败的领用不算一次；首次成功领用后仍可只凭 task_id 归还。"""
+    # 初始无小分区，small 领用失败
+    assert client.post(
+        "/tasks/acquire", json={"size": "small", "task_id": "job-a"}
+    ).status_code == 503
+    _acquire(client, "job-a")  # 首次成功领用
+    r = client.post("/tasks/release", json={"task_id": "job-a"})
+    assert r.status_code == 200, r.text
+
+
+def test_late_release_during_draining_keeps_occupancy_and_wait(client: TestClient) -> None:
+    """归还被拒时保留现有占用；正在排空的卡继续等待，不提前交给驱动。"""
+    old = _acquire(client, "job-a")
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    ).status_code == 200
+    new = _acquire(client, "job-a")
+
+    # 值班员发起改配 -> 卡进入 draining，在跑任务保留
+    assert client.post(
+        "/reconfig", json={"gpu_id": "gpu-0", "target_layout": "split"}
+    ).json()["state"] == "draining"
+
+    # 迟到的旧凭据归还 -> 409，占用保留，仍为 draining
+    r = client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    )
+    assert r.status_code == 409
+    g0 = gpu_state(client, "gpu-0")
+    assert g0["state"] == "draining"
+    assert g0["partitions"][0]["occupied_by"] == "job-a"
+
+    # 正常凭据归还最后一个分区 -> 才交给驱动
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": new["release_token"]}
+    ).status_code == 200
+    assert gpu_state(client, "gpu-0")["state"] == "reconfiguring"
+
+
+def test_rejected_release_does_not_advance_other_partitions(client: TestClient) -> None:
+    """多分区排空：被拒的归还不能让卡提前改配，最后一个正常归还才推进。"""
+    client.post("/reconfig", json={"gpu_id": "gpu-0", "target_layout": "split"})
+    client.post(
+        "/driver/report",
+        json={"gpu_id": "gpu-0", "generation": 1, "status": "success", "actual_layout": "split"},
+    )
+    old = _acquire(client, "job-a", size="small")
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    ).status_code == 200
+    tok_a = _acquire(client, "job-a", size="small")["release_token"]
+    _acquire(client, "job-b", size="small")
+
+    client.post("/reconfig", json={"gpu_id": "gpu-0", "target_layout": "large"})
+    assert gpu_state(client, "gpu-0")["state"] == "draining"
+
+    # job-a 用旧凭据归还 -> 拒，卡仍在 draining
+    r = client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": old["release_token"]}
+    )
+    assert r.status_code == 409
+    assert gpu_state(client, "gpu-0")["state"] == "draining"
+
+    # job-b 正常归还：还有一个分区被占，仍 draining
+    assert client.post("/tasks/release", json={"task_id": "job-b"}).status_code == 200
+    assert gpu_state(client, "gpu-0")["state"] == "draining"
+
+    # job-a 用当前凭据正常归还最后一个分区 -> 交给驱动
+    assert client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": tok_a}
+    ).status_code == 200
+    assert gpu_state(client, "gpu-0")["state"] == "reconfiguring"
+
+
+def test_task_record_count_does_not_grow_with_reacquire(client: TestClient) -> None:
+    """同一 ID 反复领用，服务为该 ID 保留的记录数不增长。"""
+    for _ in range(12):
+        tok = _acquire(client, "job-a")["release_token"]
+        assert client.post(
+            "/tasks/release", json={"task_id": "job-a", "release_token": tok}
+        ).status_code == 200
+    records = [r for r in service._tasks.values() if r.task_id == "job-a"]
+    assert len(records) == 1
+    assert records[0].acquire_count == 12
+    assert records[0].active is False
+
+
+def test_release_unknown_task_still_404_even_with_token(client: TestClient) -> None:
+    r = client.post(
+        "/tasks/release", json={"task_id": "nope", "release_token": "rel_whatever"}
+    )
+    assert r.status_code == 404
+
+
+def test_bogus_token_on_first_lease_is_rejected(client: TestClient) -> None:
+    """首次领用虽可省略凭据，但一旦提交凭据就必须与当前领用匹配。"""
+    _acquire(client, "job-a")
+    r = client.post(
+        "/tasks/release", json={"task_id": "job-a", "release_token": "rel_bogus"}
+    )
+    assert r.status_code == 409
+    assert gpu_state(client, "gpu-0")["partitions"][0]["occupied_by"] == "job-a"

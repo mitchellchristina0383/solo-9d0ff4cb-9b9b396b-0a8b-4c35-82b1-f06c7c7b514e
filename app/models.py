@@ -59,10 +59,23 @@ class AcquireResponse(BaseModel):
     task_id: str
     gpu_id: str
     partition_id: str
+    release_token: str = Field(
+        description=(
+            "本次领用的归还凭据。同一 task_id 再次领用后，归还必须携带该凭据；"
+            "每次成功领用都会返回新值，旧凭据立即作废"
+        )
+    )
 
 
 class ReleaseRequest(BaseModel):
     task_id: str
+    release_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "领用响应返回的归还凭据。自启动/重置以来该 task_id 的首次成功领用可省略；"
+            "再次领用后必填；只要提交了就必须与当前领用一致"
+        ),
+    )
 
 
 class ReconfigRequest(BaseModel):

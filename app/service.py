@@ -16,10 +16,21 @@
 * DRAINING / RECONFIGURING / DISABLED 的卡不参与新任务分配；另一张卡照常分配。
 * 调度只按驱动 success 回报确认的实际布局重建分区并恢复分配。
 * 回报的 generation 与卡上当前批次不一致时一律拒收（旧改配回报不能改变当前状态）。
+
+归还凭据（fencing token）：
+* 推理作业重跑会复用 task_id。每次成功领用都生成新的 release_token，
+  归还只认“当前那次领用”，避免上一轮迟到的归还请求清掉本轮占用。
+* 服务启动或 /admin/reset 之后，同一 task_id 的第一次成功领用仍允许
+  只凭 task_id 归还（兼容老客户端）；失败的领用不计数。
+* 该 task_id 再次成功领用后，归还必须携带本次返回的 release_token；
+  只要请求里带了凭据，就必须与当前领用匹配。
+* 每个 task_id 只保留一条当前领用记录（含成功领用次数），不随领用次数增长。
+* 归还被拒时不改变任何占用与卡状态；正常归还最后一个分区时才推进 draining。
 """
 from __future__ import annotations
 
 import asyncio
+import secrets
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -70,6 +81,38 @@ class GPU:
         return all(p.occupied_by is None for p in self.partitions)
 
 
+@dataclass
+class TaskRecord:
+    """单个 task_id 的长生命周期记录。
+
+    每个 task_id 只保留这一条记录，反复领用只更新字段，不追加历史，
+    因此记录数不随同一 ID 的领用次数增长。
+    """
+
+    task_id: str
+    acquire_count: int = 0          # 自启动/重置以来成功领用次数（失败的领用不计）
+    gpu_id: Optional[str] = None    # 当前占用位置；active=False 时为上次位置
+    partition_id: Optional[str] = None
+    token: Optional[str] = None     # 当前这次领用的归还凭据
+    active: bool = False            # 当前是否持有分区
+
+    @property
+    def requires_token(self) -> bool:
+        """再次（第二次及以后）成功领用后，归还必须携带凭据。"""
+        return self.acquire_count > 1
+
+
+def _new_release_token() -> str:
+    return f"rel_{secrets.token_urlsafe(24)}"
+
+
+def _token_matches(provided: str, current: Optional[str]) -> bool:
+    """定长比较，避免凭据校验泄露时序信息。"""
+    if current is None:
+        return False
+    return secrets.compare_digest(provided, current)
+
+
 def _build_partitions(gpu_id: str, layout: LayoutType) -> list[Partition]:
     if layout is LayoutType.LARGE:
         return [Partition(id=f"{gpu_id}-p0", size=PartitionSize.LARGE)]
@@ -95,8 +138,8 @@ class SchedulerService:
                 pending_target=None,
                 partitions=_build_partitions(gid, LayoutType.LARGE),
             )
-        # task_id -> (gpu_id, partition_id)
-        self._tasks: dict[str, tuple[str, str]] = {}
+        # task_id -> 当前领用记录（每个 task_id 恰好一条，反复领用只更新）
+        self._tasks: dict[str, TaskRecord] = {}
 
     # ---------- 内部工具 ----------
 
@@ -124,39 +167,91 @@ class SchedulerService:
 
     # ---------- 任务领用 / 归还 ----------
 
-    async def acquire(self, size: PartitionSize, task_id: Optional[str]) -> tuple[str, GPU, Partition]:
+    async def acquire(
+        self, size: PartitionSize, task_id: Optional[str]
+    ) -> tuple[str, str, GPU, Partition]:
+        """领用分区。成功时返回 (task_id, release_token, gpu, partition)。
+
+        重跑复用同一 task_id 时，只有上一轮已经归还（当前没有占用）才允许再次领用；
+        上一轮仍占用则 409，避免一个 ID 同时占两个分区。
+        """
         async with self._lock:
-            if task_id is not None and task_id in self._tasks:
-                raise ConflictError(f"任务 {task_id} 已持有分区，需先归还")
             tid = task_id or f"task-{uuid.uuid4().hex[:12]}"
+            record = self._tasks.get(tid)
+            if record is not None and record.active:
+                raise ConflictError(f"任务 {tid} 已持有分区，需先归还")
 
             # 只有 ACTIVE 卡接新任务；按分区规格精确匹配，卡间按 id 顺序遍历
-            for gpu in self._gpus.values():
-                if gpu.state is not GPUState.ACTIVE:
-                    continue
-                for part in gpu.partitions:
-                    if part.size is size and part.occupied_by is None:
-                        part.occupied_by = tid
-                        self._tasks[tid] = (gpu.id, part.id)
-                        return tid, gpu, part
-
-            raise ConflictError(
-                f"当前没有空闲的 {size.value} 分区（停用中的卡不参与分配）",
-                status_code=503,
-            )
-
-    async def release(self, task_id: str) -> tuple[GPU, Partition]:
-        async with self._lock:
-            location = self._tasks.pop(task_id, None)
+            location = self._find_free_partition(size)
             if location is None:
+                # 失败的领用不改变记录，也不算一次成功领用
+                raise ConflictError(
+                    f"当前没有空闲的 {size.value} 分区（停用中的卡不参与分配）",
+                    status_code=503,
+                )
+            gpu, part = location
+
+            token = _new_release_token()
+            part.occupied_by = tid
+            # 原地更新同一个 TaskRecord：记录数不随领用次数增长。
+            # 本次没有拿到分区前不递增，保证失败领用计数不变。
+            if record is None:
+                record = TaskRecord(task_id=tid)
+                self._tasks[tid] = record
+            record.acquire_count += 1
+            record.gpu_id = gpu.id
+            record.partition_id = part.id
+            record.token = token
+            record.active = True
+            return tid, token, gpu, part
+
+    def _find_free_partition(
+        self, size: PartitionSize
+    ) -> Optional[tuple[GPU, Partition]]:
+        for gpu in self._gpus.values():
+            if gpu.state is not GPUState.ACTIVE:
+                continue
+            for part in gpu.partitions:
+                if part.size is size and part.occupied_by is None:
+                    return gpu, part
+        return None
+
+    async def release(
+        self, task_id: str, release_token: Optional[str] = None
+    ) -> tuple[GPU, Partition]:
+        """归还分区；凭据校验失败时保持现有占用与卡状态不变。"""
+        async with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None or not record.active:
                 raise NotFoundError(f"未知任务或分区已归还: {task_id}")
-            gpu_id, part_id = location
-            gpu = self._get_gpu(gpu_id)
-            part = next((p for p in gpu.partitions if p.id == part_id), None)
+
+            # 只要请求带了凭据，就必须与“当前这次领用”匹配；带了旧凭据一律拒收。
+            if release_token is not None and not _token_matches(
+                release_token, record.token
+            ):
+                raise ConflictError(
+                    f"任务 {task_id} 的归还凭据与当前领用不匹配，"
+                    "拒绝归还（迟到的上一轮归还不能释放本次占用）"
+                )
+            # 同一 ID 再次成功领用后，必须携带本次返回的凭据。
+            if release_token is None and record.requires_token:
+                raise ConflictError(
+                    f"任务 {task_id} 已再次领用，归还必须携带本次 /tasks/acquire "
+                    "返回的 release_token"
+                )
+
+            gpu = self._get_gpu(record.gpu_id or "")
+            part = next(
+                (p for p in gpu.partitions if p.id == record.partition_id), None
+            )
             if part is None or part.occupied_by != task_id:
                 # 理论上不会出现：任务表与分区占用保持一致
                 raise ConflictError("任务占用记录与分区状态不一致")
             part.occupied_by = None
+            # 记录保留下来作为该 ID 的“历史成功次数”，用于判断重跑后是否必须
+            # 携带凭据；当前凭据随归还作废，记录本身不释放。
+            record.active = False
+            record.token = None
             self._pump(gpu)
             return gpu, part
 

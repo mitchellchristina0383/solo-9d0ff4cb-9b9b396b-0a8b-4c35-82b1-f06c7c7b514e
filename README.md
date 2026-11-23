@@ -15,6 +15,22 @@
   任务结束按 `task_id` 归还分区。
 - 初始状态：两张卡均为 `large` 布局、`active`。
 
+### 归还凭据（防迟到归还）
+
+推理作业重跑会复用 `task_id`，上一轮的归还请求可能晚到。为此：
+
+1. **每次成功领用都返回新的 `release_token`**，并立即让该 ID 之前的凭据作废。
+2. 从服务启动或 `/admin/reset` 起，同一 `task_id` 的**首次成功领用**后，
+   仍可只凭 `task_id` 归还（兼容老客户端）。**失败的领用不算一次**。
+3. 该 `task_id` **再次成功领用**后，归还必须携带本次返回的凭据；只带
+   `task_id` 会被 `409` 拒绝。
+4. **只要提交了凭据，就必须与当前领用匹配**（含伪造/上一轮的旧凭据），
+   否则 `409`；归还是原子的，被拒时现有占用与卡状态都不变，正在排空的卡
+   继续等待，不会因迟到请求提前改配。
+5. 同一 ID 在服务端**只保留一条记录**，反复领用只更新该记录（成功次数、
+   当前位置、当前凭据），记录数不随领用次数增长。
+6. 最后一个分区**正常归还**后，排空中的卡照常进入 `reconfiguring` 交给驱动。
+
 ### 卡状态机
 
 | 状态 | 含义 | 是否接新任务 |
@@ -52,7 +68,7 @@ app/
   service.py   # 调度状态机（GPU/分区数据结构、领用归还、改配、驱动回报）
   main.py      # FastAPI 路由与异常映射
 tests/
-  test_scheduler.py   # 13 个端到端测试（TestClient 打真实路由）
+  test_scheduler.py   # 23 个端到端测试（TestClient 打真实路由）
 scripts/
   smoke.sh            # 真实 uvicorn + curl 的冒烟脚本
 Dockerfile
@@ -82,8 +98,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- |
 | `GET /gpus` | 两张卡的实时状态（状态、已确认布局、批次号、目标布局、分区占用） |
 | `GET /gpus/{gpu_id}` | 单卡状态 |
-| `POST /tasks/acquire` | 按 `size` 领用分区，可带 `task_id` 或由服务端生成 |
-| `POST /tasks/release` | 任务结束归还分区；draining 卡借此自动推进到 reconfiguring |
+| `POST /tasks/acquire` | 按 `size` 领用分区，可带 `task_id` 或由服务端生成；**每次成功领用返回新的 `release_token`** |
+| `POST /tasks/release` | 任务结束归还分区，可带 `release_token`；再次领用后必须带，且须与当前领用一致；draining 卡借此自动推进到 reconfiguring |
 | `POST /reconfig` | 值班员发起改配，返回 `generation`（驱动回报必须带同一批次号） |
 | `POST /driver/report` | 模拟驱动回报成功（带 `actual_layout`）或失败 |
 | `POST /admin/reset` | 重置为初始状态（测试用） |
@@ -111,19 +127,42 @@ curl -X POST localhost:8000/driver/report -H 'Content-Type: application/json' \
 # 再用同一 generation 补报 success + actual_layout 即恢复。
 ```
 
+### 重跑 / 迟到归还演示（/docs 可操作）
+
+```bash
+# 1) 首次领用，记下返回的 release_token（老客户端可忽略它）
+curl -X POST localhost:8000/tasks/acquire -H 'Content-Type: application/json' \
+  -d '{"size":"large","task_id":"rerun"}'      # -> {... "release_token":"rel_..."}
+# 2) 首次可只凭 task_id 归还
+curl -X POST localhost:8000/tasks/release -H 'Content-Type: application/json' \
+  -d '{"task_id":"rerun"}'
+# 3) 同 ID 重跑，再次领用 -> 拿到新凭据，旧凭据作废
+curl -X POST localhost:8000/tasks/acquire -H 'Content-Type: application/json' \
+  -d '{"size":"large","task_id":"rerun"}'      # -> 新的 release_token
+# 4) 上一轮归还迟到（旧凭据）-> 409，本次占用保留
+curl -X POST localhost:8000/tasks/release -H 'Content-Type: application/json' \
+  -d '{"task_id":"rerun","release_token":"<旧 release_token>"}'
+# 5) 再次领用后不带凭据 -> 409；带上当前凭据 -> 200
+curl -X POST localhost:8000/tasks/release -H 'Content-Type: application/json' \
+  -d '{"task_id":"rerun","release_token":"<当前 release_token>"}'
+```
+
 ## 五、实测结果
 
-### 自动化测试（13 项，全部通过）
+### 自动化测试（23 项，全部通过）
 
 ```
-13 passed in 1.00s
+23 passed in 1.30s
 ```
 
 覆盖：初始布局、领还分区、无匹配分区 503、空闲卡直接 reconfiguring、
 **新申请与改配交错**（停用卡停接/另一张照常/归还后自动交驱动/按确认布局恢复）、
 **失败后停用与同批次补报**、重复失败保持停用、**旧批次与未来批次回报拒收**、
 批次结束后重复回报拒收、success 缺 actual_layout 拒收、重复 task_id、
-同布局改配拒绝、未知 GPU/任务 404、draining 期间在跑任务保留。
+同布局改配拒绝、未知 GPU/任务 404、draining 期间在跑任务保留；
+以及**归还凭据**：每次领用返回新凭据、首轮可只凭 task_id 归还、失败领用不计数、
+再次领用后必须带凭据、迟到旧凭据被拒且不清占用、排空卡被拒后继续等待、
+最后一个分区正常归还才交给驱动、反复领用只保留一条记录、伪造凭据被拒。
 
 ### 真实进程冒烟（uvicorn + curl，`scripts/smoke.sh`）
 
@@ -139,6 +178,10 @@ curl -X POST localhost:8000/driver/report -H 'Content-Type: application/json' \
 3. 旧回报拒收：批次 #2 进行中拿批次 #1 回报 →
    `409 回报批次 #1 与当前批次 #2 不一致，旧改配回报一律忽略`，
    卡保持 `reconfiguring`、已确认布局不变；批次号 99 等未来批次同样拒收。
+4. 重跑凭据：首轮只凭 task_id 归还 `200`；同 ID 再次领用返回不同凭据；
+   上一轮旧凭据迟到 → `409` 且 `occupied_by` 仍为当前任务；再次领用后不带
+   凭据 `409`；draining 期间旧凭据仍被拒、卡保持 `draining`；用当前凭据正常
+   归还最后一个分区 → `reconfiguring`，驱动 success 后 `active/split`，改配照常完成。
 
 ## 六、余项与边界说明
 
@@ -148,6 +191,12 @@ curl -X POST localhost:8000/driver/report -H 'Content-Type: application/json' \
   初始化与 `_build_partitions` 即可。
 - 未实现任务超时/抢占：draining 完全等待任务主动归还，符合“在跑任务照常结束”
   的要求。
+- 归还凭据按题面“每次领用返回新凭据”实现为**每次领用必换新**，并非仅重跑时
+  才换；老客户端只在“自启动/重置以来首次成功领用”这一窗口内可省凭据，跨过
+  重跑后必须升级为携带凭据。
+- 凭据按 task_id 记录在内存中，重启/重置后清空；多副本部署需把当前凭据
+  与领用记录放入共享存储（Redis/DB）才能跨实例生效。
 - 当前环境未安装 Docker，Dockerfile 与 docker-compose.yml 已按 Compose 规范
   编写并通过 YAML 校验，实际容器启动需在有 Docker 的机器上执行
-  `docker compose up --build`；所有功能已在本机 venv + uvicorn 实测通过。
+  `docker compose up --build`；所有功能已在本机依赖目录 + uvicorn 实测通过，
+  `/docs` 与 OpenAPI 已确认暴露 `release_token` 字段。
